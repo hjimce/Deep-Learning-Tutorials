@@ -1,93 +1,37 @@
+#coding=utf-8
 from collections import OrderedDict
-import copy
 import cPickle
-import gzip
 import os
-import urllib
 import random
-import stat
-import subprocess
-import sys
-import timeit
-
 import numpy
-
 import theano
 from theano import tensor as T
 
-# Otherwise the deepcopy fails
-import sys
-sys.setrecursionlimit(1500)
 
-PREFIX = os.getenv(
-    'ATISDATA',
-    os.path.join(os.path.split(os.path.abspath(os.path.dirname(__file__)))[0],
-                 'data'))
-
-
-# utils functions
+# 打乱样本数据
 def shuffle(lol, seed):
-    '''
-    lol :: list of list as input
-    seed :: seed the shuffling
-
-    shuffle inplace each list in the same order
-    '''
     for l in lol:
         random.seed(seed)
         random.shuffle(l)
 
 
-# start-snippet-1
+#输入一个长句，我们根据窗口获取每个win内的数据，作为一个样本。或者也可以称之为作为RNN的某一时刻的输入
 def contextwin(l, win):
-    '''
-    win :: int corresponding to the size of the window
-    given a list of indexes composing a sentence
-
-    l :: array containing the word indexes
-
-    it will return a list of list of indexes corresponding
-    to context windows surrounding each word in the sentence
-    '''
     assert (win % 2) == 1
     assert win >= 1
     l = list(l)
 
-    lpadded = win // 2 * [-1] + l + win // 2 * [-1]
+    lpadded = win // 2 * [-1] + l + win // 2 * [-1]#在一个句子的末尾、开头，可能win size内不知，我们用-1 padding
     out = [lpadded[i:(i + win)] for i in range(len(l))]
 
     assert len(out) == len(l)
     return out
-# end-snippet-1
 
 
-# data loading functions
-def atisfold(fold):
-    assert fold in range(5)
-    filename = os.path.join(PREFIX, 'atis.fold'+str(fold)+'.pkl.gz')
-    f = gzip.open(filename, 'rb')
-    train_set, valid_set, test_set, dicts = cPickle.load(f)
-    return train_set, valid_set, test_set, dicts
 
 
-# metrics function using conlleval.pl
-def conlleval(p, g, w, filename, script_path):
-    '''
-    INPUT:
-    p :: predictions
-    g :: groundtruth
-    w :: corresponding words
-
-    OUTPUT:
-    filename :: name of the file where the predictions
-    are written. it will be the input of conlleval.pl script
-    for computing the performance in terms of precision
-    recall and f1 score
-
-    OTHER:
-    script_path :: path to the directory containing the
-    conlleval.pl script
-    '''
+# 输出结果，用于脚本conlleval.pl的精度测试，该脚本需要自己下载，在windows下调用命令为:perl conlleval.pl < filename
+def conlleval(p, g, w, filename):
     out = ''
     for sl, sp, sw in zip(g, p, w):
         out += 'BOS O O\n'
@@ -99,295 +43,117 @@ def conlleval(p, g, w, filename, script_path):
     f.writelines(out)
     f.close()
 
-    return get_perf(filename, script_path)
 
 
-def download(origin, destination):
-    '''
-    download the corresponding atis file
-    from http://www-etud.iro.umontreal.ca/~mesnilgr/atis/
-    '''
-    print 'Downloading data from %s' % origin
-    urllib.urlretrieve(origin, destination)
 
-
-def get_perf(filename, folder):
-    ''' run conlleval.pl perl script to obtain
-    precision/recall and F1 score '''
-    _conlleval = os.path.join(folder, 'conlleval.pl')
-    if not os.path.isfile(_conlleval):
-        url = 'http://www-etud.iro.umontreal.ca/~mesnilgr/atis/conlleval.pl'
-        download(url, _conlleval)
-        os.chmod(_conlleval, stat.S_IRWXU)  # give the execute permissions
-
-    proc = subprocess.Popen(["perl",
-                            _conlleval],
-                            stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE)
-
-    stdout, _ = proc.communicate(''.join(open(filename).readlines()))
-    for line in stdout.split('\n'):
-        if 'accuracy' in line:
-            out = line.split()
-            break
-
-    precision = float(out[6][:-2])
-    recall = float(out[8][:-2])
-    f1score = float(out[10])
-
-    return {'p': precision, 'r': recall, 'f1': f1score}
-
-
-# start-snippet-2
 class RNNSLU(object):
-    ''' elman neural net model '''
     def __init__(self, nh, nc, ne, de, cs):
         '''
-        nh :: dimension of the hidden layer
-        nc :: number of classes
-        ne :: number of word embeddings in the vocabulary
-        de :: dimension of the word embeddings
-        cs :: word window context size
+        nh ::隐藏层神经元个数
+        nc ::输出层标签分类类别
+        ne :: 单词的个数
+        de :: 词向量的维度
+        cs :: 上下文窗口
         '''
-        # parameters of the model
-        self.emb = theano.shared(name='embeddings',
-                                 value=0.2 * numpy.random.uniform(-1.0, 1.0,
-                                 (ne+1, de))
-                                 # add one for padding at the end
-                                 .astype(theano.config.floatX))
-        self.wx = theano.shared(name='wx',
-                                value=0.2 * numpy.random.uniform(-1.0, 1.0,
-                                (de * cs, nh))
-                                .astype(theano.config.floatX))
-        self.wh = theano.shared(name='wh',
-                                value=0.2 * numpy.random.uniform(-1.0, 1.0,
-                                (nh, nh))
-                                .astype(theano.config.floatX))
-        self.w = theano.shared(name='w',
-                               value=0.2 * numpy.random.uniform(-1.0, 1.0,
-                               (nh, nc))
-                               .astype(theano.config.floatX))
-        self.bh = theano.shared(name='bh',
-                                value=numpy.zeros(nh,
-                                dtype=theano.config.floatX))
-        self.b = theano.shared(name='b',
-                               value=numpy.zeros(nc,
-                               dtype=theano.config.floatX))
-        self.h0 = theano.shared(name='h0',
-                                value=numpy.zeros(nh,
-                                dtype=theano.config.floatX))
+        #词向量实际为(ne, de)，外加1行，是为了边界标签-1而设定的
+        self.emb = theano.shared(name='embeddings',value=0.2 * numpy.random.uniform(-1.0, 1.0,(ne+1, de)).astype(theano.config.floatX))#词向量空间
+        self.wx = theano.shared(name='wx',value=0.2 * numpy.random.uniform(-1.0, 1.0,(de * cs, nh)).astype(theano.config.floatX))#输入数据到隐藏层的权重矩阵
+        self.wh = theano.shared(name='wh', value=0.2 * numpy.random.uniform(-1.0, 1.0,(nh, nh)).astype(theano.config.floatX))#上一时刻隐藏到本时刻隐藏层循环递归的权值矩阵
+        self.w = theano.shared(name='w',value=0.2 * numpy.random.uniform(-1.0, 1.0,(nh, nc)).astype(theano.config.floatX))#隐藏层到输出层的权值矩阵
+        self.bh = theano.shared(name='bh', value=numpy.zeros(nh,dtype=theano.config.floatX))#隐藏层偏置参数
+        self.b = theano.shared(name='b',value=numpy.zeros(nc,dtype=theano.config.floatX))#输出层偏置参数
 
-        # bundle
-        self.params = [self.emb, self.wx, self.wh, self.w,
-                       self.bh, self.b, self.h0]
-        # end-snippet-2
-        # as many columns as context window size
-        # as many lines as words in the sentence
-        # start-snippet-3
+        self.h0 = theano.shared(name='h0',value=numpy.zeros(nh,dtype=theano.config.floatX))
+
+
+        self.params = [self.emb, self.wx, self.wh, self.w,self.bh, self.b, self.h0]#所有待学习的参数
+
         idxs = T.imatrix()
         x = self.emb[idxs].reshape((idxs.shape[0], de*cs))
-        y_sentence = T.ivector('y_sentence')  # labels
-        # end-snippet-3 start-snippet-4
+        y_sentence = T.ivector('y_sentence')  # 训练样本标签
 
         def recurrence(x_t, h_tm1):
-            h_t = T.nnet.sigmoid(T.dot(x_t, self.wx)
-                                 + T.dot(h_tm1, self.wh) + self.bh)
-            s_t = T.nnet.softmax(T.dot(h_t, self.w) + self.b)
+            h_t = T.nnet.sigmoid(T.dot(x_t, self.wx) + T.dot(h_tm1, self.wh) + self.bh)#通过ht-1、x计算隐藏层
+            s_t = T.nnet.softmax(T.dot(h_t, self.w) + self.b)#计算输出层
             return [h_t, s_t]
 
         [h, s], _ = theano.scan(fn=recurrence,
                                 sequences=x,
                                 outputs_info=[self.h0, None],
                                 n_steps=x.shape[0])
-
+        #神经网络的输出
         p_y_given_x_sentence = s[:, 0, :]
         y_pred = T.argmax(p_y_given_x_sentence, axis=1)
-        # end-snippet-4
 
-        # cost and gradients and learning rate
-        # start-snippet-5
-        lr = T.scalar('lr')
 
-        sentence_nll = -T.mean(T.log(p_y_given_x_sentence)
-                               [T.arange(x.shape[0]), y_sentence])
+        #计算损失函数，然后进行梯度下降
+        lr = T.scalar('lr')#学习率，一会儿作为输入参数
+        sentence_nll = -T.mean(T.log(p_y_given_x_sentence)[T.arange(x.shape[0]), y_sentence])
         sentence_gradients = T.grad(sentence_nll, self.params)
-        sentence_updates = OrderedDict((p, p - lr*g)
-                                       for p, g in
-                                       zip(self.params, sentence_gradients))
-        # end-snippet-5
+        sentence_updates = OrderedDict((p, p - lr*g) for p, g in zip(self.params, sentence_gradients))
 
-        # theano functions to compile
-        # start-snippet-6
+
+        #构造预测函数、训练函数，输入数据idxs每一行是一个样本(也就是一个窗口内的序列索引)
         self.classify = theano.function(inputs=[idxs], outputs=y_pred)
-        self.sentence_train = theano.function(inputs=[idxs, y_sentence, lr],
-                                              outputs=sentence_nll,
-                                              updates=sentence_updates)
-        # end-snippet-6 start-snippet-7
-        self.normalize = theano.function(inputs=[],
-                                         updates={self.emb:
-                                                  self.emb /
-                                                  T.sqrt((self.emb**2)
-                                                  .sum(axis=1))
-                                                  .dimshuffle(0, 'x')})
-        # end-snippet-7
+        self.sentence_train = theano.function(inputs=[idxs, y_sentence, lr],outputs=sentence_nll,updates=sentence_updates)
+        #词向量归一化，因为我们希望训练出来的向量是一个归一化向量
+        self.normalize = theano.function(inputs=[],updates={self.emb:self.emb /T.sqrt((self.emb**2).sum(axis=1)).dimshuffle(0, 'x')})
 
+    #训练
     def train(self, x, y, window_size, learning_rate):
 
-        cwords = contextwin(x, window_size)
-        words = map(lambda x: numpy.asarray(x).astype('int32'), cwords)
+        cwords = contextwin(x, window_size)#获取训练样本
+        words = map(lambda x: numpy.asarray(x).astype('int32'), cwords)#数据格式转换
         labels = y
 
         self.sentence_train(words, labels, learning_rate)
         self.normalize()
 
+    #保存、加载训练模型
     def save(self, folder):
         for param in self.params:
             numpy.save(os.path.join(folder,
                        param.name + '.npy'), param.get_value())
-
     def load(self, folder):
         for param in self.params:
             param.set_value(numpy.load(os.path.join(folder,
                             param.name + '.npy')))
 
 
-def main(param=None):
-    if not param:
-        param = {
-            'fold': 3,
-            # 5 folds 0,1,2,3,4
-            'data': 'atis',
-            'lr': 0.0970806646812754,
-            'verbose': 1,
-            'decay': True,
-            # decay on the learning rate if improvement stops
-            'win': 7,
-            # number of words in the context window
-            'nhidden': 200,
-            # number of hidden units
-            'seed': 345,
-            'emb_dimension': 50,
-            # dimension of word embedding
-            'nepochs': 60,
-            # 60 is recommended
-            'savemodel': False}
-    print param
+def main():
 
-    folder_name = os.path.basename(__file__).split('.')[0]
-    folder = os.path.join(os.path.dirname(__file__), folder_name)
-    if not os.path.exists(folder):
-        os.mkdir(folder)
-
-    # load the dataset
-    train_set, valid_set, test_set, dic = atisfold(param['fold'])
-
-    idx2label = dict((k, v) for v, k in dic['labels2idx'].iteritems())
-    idx2word = dict((k, v) for v, k in dic['words2idx'].iteritems())
-
+    train_set, valid_set,test_set, dicts = cPickle.load(open("atis.fold3.pkl//atis.fold3.pkl"))#加载训练数据
+    idx2label = dict((k, v) for v, k in dicts['labels2idx'].iteritems())#每个类别标签名字所对应的索引
+    idx2word = dict((k, v) for v, k in dicts['words2idx'].iteritems())#每个词的索引
     train_lex, train_ne, train_y = train_set
     valid_lex, valid_ne, valid_y = valid_set
     test_lex, test_ne, test_y = test_set
 
-    vocsize = len(set(reduce(lambda x, y: list(x) + list(y),
-                             train_lex + valid_lex + test_lex)))
-    nclasses = len(set(reduce(lambda x, y: list(x)+list(y),
-                              train_y + test_y + valid_y)))
-    nsentences = len(train_lex)
+    #计算相关参数
+    vocsize = len(set(reduce(lambda x, y: list(x) + list(y),train_lex + valid_lex + test_lex)))#计算词的个数
+    nclasses = len(set(reduce(lambda x, y: list(x)+list(y),train_y + test_y + valid_y)))#计算样本类别个数
+    winsize=7#窗口大小
+    ndim=50#词向量维度
+    nhidden=200#隐藏层的神经元个数
+    learn_rate=0.0970806646812754#梯度下降学习率
 
-    groundtruth_valid = [map(lambda x: idx2label[x], y) for y in valid_y]
-    words_valid = [map(lambda x: idx2word[x], w) for w in valid_lex]
-    groundtruth_test = [map(lambda x: idx2label[x], y) for y in test_y]
-    words_test = [map(lambda x: idx2word[x], w) for w in test_lex]
-
-    # instanciate the model
-    numpy.random.seed(param['seed'])
-    random.seed(param['seed'])
-
-    rnn = RNNSLU(nh=param['nhidden'],
-                 nc=nclasses,
-                 ne=vocsize,
-                 de=param['emb_dimension'],
-                 cs=param['win'])
-
-    # train with early stopping on validation set
-    best_f1 = -numpy.inf
-    param['clr'] = param['lr']
-    for e in xrange(param['nepochs']):
-
-        # shuffle
-        shuffle([train_lex, train_ne, train_y], param['seed'])
-
-        param['ce'] = e
-        tic = timeit.default_timer()
-
+    #构建RNN，开始训练
+    rnn = RNNSLU(nh=nhidden,nc=nclasses,ne=vocsize,de=ndim,cs=winsize)
+    epoch=0
+    while epoch<10:
+        shuffle([train_lex, train_ne, train_y], 345)
         for i, (x, y) in enumerate(zip(train_lex, train_y)):
-            rnn.train(x, y, param['win'], param['clr'])
-            print '[learning] epoch %i >> %2.2f%%' % (
-                e, (i + 1) * 100. / nsentences),
-            print 'completed in %.2f (sec) <<\r' % (timeit.default_timer() - tic),
-            sys.stdout.flush()
+            rnn.train(x, y,winsize,learn_rate)
+        print epoch
+        epoch+=1
+    #测试集的输出标签
+    predictions_test = [map(lambda x: idx2label[x],rnn.classify(numpy.asarray(contextwin(x,winsize)).astype('int32'))) for x in test_lex]
+    #测试集的正确标签、及其对应的文本
+    groundtruth_test = [map(lambda x: idx2label[x], y) for y in test_y]
 
-        # evaluation // back into the real world : idx -> words
-        predictions_test = [map(lambda x: idx2label[x],
-                            rnn.classify(numpy.asarray(
-                            contextwin(x, param['win'])).astype('int32')))
-                            for x in test_lex]
-        predictions_valid = [map(lambda x: idx2label[x],
-                             rnn.classify(numpy.asarray(
-                             contextwin(x, param['win'])).astype('int32')))
-                             for x in valid_lex]
-
-        # evaluation // compute the accuracy using conlleval.pl
-        res_test = conlleval(predictions_test,
-                             groundtruth_test,
-                             words_test,
-                             folder + '/current.test.txt',
-                             folder)
-        res_valid = conlleval(predictions_valid,
-                              groundtruth_valid,
-                              words_valid,
-                              folder + '/current.valid.txt',
-                              folder)
-
-        if res_valid['f1'] > best_f1:
-
-            if param['savemodel']:
-                rnn.save(folder)
-
-            best_rnn = copy.deepcopy(rnn)
-            best_f1 = res_valid['f1']
-
-            if param['verbose']:
-                print('NEW BEST: epoch', e,
-                      'valid F1', res_valid['f1'],
-                      'best test F1', res_test['f1'])
-
-            param['vf1'], param['tf1'] = res_valid['f1'], res_test['f1']
-            param['vp'], param['tp'] = res_valid['p'], res_test['p']
-            param['vr'], param['tr'] = res_valid['r'], res_test['r']
-            param['be'] = e
-
-            subprocess.call(['mv', folder + '/current.test.txt',
-                            folder + '/best.test.txt'])
-            subprocess.call(['mv', folder + '/current.valid.txt',
-                            folder + '/best.valid.txt'])
-        else:
-            if param['verbose']:
-                print ''
-
-        # learning rate decay if no improvement in 10 epochs
-        if param['decay'] and abs(param['be']-param['ce']) >= 10:
-            param['clr'] *= 0.5
-            rnn = best_rnn
-
-        if param['clr'] < 1e-5:
-            break
-
-    print('BEST RESULT: epoch', param['be'],
-          'valid F1', param['vf1'],
-          'best test F1', param['tf1'],
-          'with the model', folder)
+    words_test = [map(lambda x: idx2word[x], w) for w in test_lex]
+    conlleval(predictions_test,groundtruth_test,words_test, 'current.test.txt')
 
 
-if __name__ == '__main__':
-    main()
+
+main()
